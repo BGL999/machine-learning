@@ -1,28 +1,22 @@
 import os
 import numpy as np
 import cv2
-from skimage.feature import hog, local_binary_pattern, graycomatrix, graycoprops
-from sklearn.model_selection import GridSearchCV, StratifiedKFold, train_test_split
-from sklearn.preprocessing import StandardScaler, LabelEncoder
+from skimage.feature import hog, local_binary_pattern
+import matplotlib.pyplot as plt
+from sklearn.model_selection import GridSearchCV, cross_val_score, StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier, VotingClassifier, StackingClassifier
-from sklearn.neighbors import KNeighborsClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-import xgboost as xgb
-from sklearn.naive_bayes import GaussianNB
 import joblib
 import warnings
-import pandas as pd
-from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
 
-class OptimizedPlantClassifier:
-    def __init__(self, data_path, img_size=(64, 64)):  # 减小图片尺寸以减少计算量
+class MultiFeaturePlantClassifier:
+    def __init__(self, data_path, img_size=(128, 128)):
         """
-        初始化优化植物分类器
+        初始化多特征植物分类器
         Args:
             data_path: 数据集路径
             img_size: 统一调整的图像尺寸
@@ -36,10 +30,8 @@ class OptimizedPlantClassifier:
         self.pca = None
         self.model = None
         self.best_params_ = None
-        self.label_encoder = LabelEncoder()
-        self.feature_names = []  # 用于记录特征名称
 
-    def load_all_images(self, use_augmentation=False):
+    def load_all_images(self):
         """加载所有图像数据"""
         print("正在加载所有图像数据...")
         self.classes = sorted([d for d in os.listdir(self.data_path)
@@ -62,10 +54,12 @@ class OptimizedPlantClassifier:
 
             print(f"\n处理类别 '{class_name}' ({len(image_files)} 张图片):")
 
-            # 使用tqdm显示进度
-            for img_path in tqdm(image_files, desc=f"处理{class_name}"):
-                # 提取核心特征（减少特征维度）
-                features = self.extract_optimized_features(img_path)
+            for i, img_path in enumerate(image_files):
+                if total_images % 50 == 0 and total_images > 0:
+                    print(f"  已处理 {total_images} 张图片...")
+
+                # 提取多特征
+                features = self.extract_multi_features(img_path)
                 if features is not None:
                     self.features.append(features)
                     self.labels.append(class_idx)
@@ -73,9 +67,6 @@ class OptimizedPlantClassifier:
 
         self.features = np.array(self.features)
         self.labels = np.array(self.labels)
-
-        # 编码标签
-        self.labels = self.label_encoder.fit_transform(self.labels)
 
         print(f"\n{'=' * 60}")
         print(f"数据加载完成:")
@@ -89,9 +80,9 @@ class OptimizedPlantClassifier:
             print(f"    {class_name}: {count} 张图片")
         print('=' * 60)
 
-    def extract_optimized_features(self, img_path):
+    def extract_multi_features(self, img_path):
         """
-        提取优化的特征集 - 减少特征维度，聚焦关键特征
+        提取多种特征融合
         Args:
             img_path: 图像路径
         Returns:
@@ -110,23 +101,23 @@ class OptimizedPlantClassifier:
 
             feature_vector = []
 
-            # 1. 颜色特征（选择最重要的一种颜色空间）
-            color_features = self.extract_color_features(img_resized)
-            feature_vector.extend(color_features)
-
-            # 2. HOG特征（只使用一种尺度）
+            # 1. HOG特征（形状和边缘特征）
             hog_features = self.extract_hog_features(gray)
             feature_vector.extend(hog_features)
 
-            # 3. LBP特征（单一尺度）
+            # 2. 颜色直方图特征（颜色分布）
+            color_features = self.extract_color_features(img_resized)
+            feature_vector.extend(color_features)
+
+            # 3. LBP特征（局部纹理特征）
             lbp_features = self.extract_lbp_features(gray)
             feature_vector.extend(lbp_features)
 
-            # 4. 形状特征（Hu矩）
-            shape_features = self.extract_shape_features(gray)
-            feature_vector.extend(shape_features)
+            # 4. Hu矩（形状不变特征）
+            hu_features = self.extract_hu_moments(gray)
+            feature_vector.extend(hu_features)
 
-            # 5. 边缘特征
+            # 5. 边缘特征统计
             edge_features = self.extract_edge_features(gray)
             feature_vector.extend(edge_features)
 
@@ -136,332 +127,248 @@ class OptimizedPlantClassifier:
             print(f"处理图像 {img_path} 时出错: {e}")
             return None
 
-    def extract_color_features(self, color_img):
-        """提取优化的颜色特征"""
-        features = []
-
-        # RGB颜色直方图（减少bins数量）
-        for i in range(3):
-            hist = cv2.calcHist([color_img], [i], None, [32], [0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-            features.extend(hist)
-
-        # HSV颜色空间的统计特征
-        hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
-        hsv_features = []
-        for i in range(3):
-            channel = hsv[:, :, i]
-            hsv_features.extend([np.mean(channel), np.std(channel), np.median(channel)])
-        features.extend(hsv_features)
-
-        return features
-
     def extract_hog_features(self, gray_img):
         """提取HOG特征"""
-        # 使用中等单元格大小
-        hog_features = hog(
+        # 使用较大的单元格减少特征维度
+        features = hog(
             gray_img,
-            orientations=8,  # 减少方向数
+            orientations=9,
             pixels_per_cell=(16, 16),
             cells_per_block=(2, 2),
             block_norm='L2-Hys',
             feature_vector=True
         )
-        return hog_features
+        return features
 
-    def extract_lbp_features(self, gray_img):
-        """提取LBP特征"""
-        radius = 2
-        n_points = 8 * radius
-        lbp = local_binary_pattern(gray_img, n_points, radius, method='uniform')
-        hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, n_points + 3), range=(0, n_points + 2))
-        hist = hist.astype("float")
-        hist /= (hist.sum() + 1e-6)
-        return hist
-
-    def extract_shape_features(self, gray_img):
-        """提取形状特征"""
+    def extract_color_features(self, color_img):
+        """提取颜色直方图特征"""
         features = []
 
-        # Hu矩
-        moments = cv2.moments(gray_img)
-        hu_moments = cv2.HuMoments(moments).flatten()
+        # RGB颜色直方图
+        for i in range(3):
+            hist = cv2.calcHist([color_img], [i], None, [32], [0, 256])
+            hist = cv2.normalize(hist, hist).flatten()
+            features.extend(hist)
 
-        # 对Hu矩进行对数变换
-        for moment in hu_moments:
-            if moment != 0:
-                features.append(-np.sign(moment) * np.log10(abs(moment)))
+        # HSV颜色空间（对光照变化更鲁棒）
+        hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
+        for i in range(3):
+            if i == 0:  # Hue通道
+                hist = cv2.calcHist([hsv], [i], None, [32], [0, 180])
             else:
-                features.append(0)
+                hist = cv2.calcHist([hsv], [i], None, [32], [0, 256])
+            hist = cv2.normalize(hist, hist).flatten()
+            features.extend(hist)
 
         return features
 
-    def extract_edge_features(self, gray_img):
-        """提取边缘特征"""
-        features = []
+    def extract_lbp_features(self, gray_img):
+        """提取LBP纹理特征"""
+        # 计算LBP
+        radius = 2
+        n_points = 8 * radius
+        lbp = local_binary_pattern(gray_img, n_points, radius, method='uniform')
 
-        # Sobel边缘
+        # 计算直方图
+        hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, n_points + 3), range=(0, n_points + 2))
+        hist = hist.astype("float")
+        hist /= (hist.sum() + 1e-6)  # 归一化
+
+        return hist
+
+    def extract_hu_moments(self, gray_img):
+        """提取Hu矩特征"""
+        moments = cv2.moments(gray_img)
+        hu_moments = cv2.HuMoments(moments).flatten()
+        # 对数变换增强数值稳定性
+        hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
+        return hu_moments
+
+    def extract_edge_features(self, gray_img):
+        """提取边缘特征统计"""
+        # Sobel边缘检测
         sobelx = cv2.Sobel(gray_img, cv2.CV_64F, 1, 0, ksize=3)
         sobely = cv2.Sobel(gray_img, cv2.CV_64F, 0, 1, ksize=3)
+
         sobel_magnitude = np.sqrt(sobelx ** 2 + sobely ** 2)
 
         edge_features = [
             np.mean(sobel_magnitude),
             np.std(sobel_magnitude),
-            np.max(sobel_magnitude)
+            np.max(sobel_magnitude),
+            np.sum(sobel_magnitude > np.mean(sobel_magnitude)) / sobel_magnitude.size
         ]
 
-        features.extend(edge_features)
-        return features
+        return edge_features
 
-    def preprocess_features(self, use_pca=True, variance_ratio=0.95):
+    def preprocess_features(self):
         """特征预处理"""
         print("\n正在进行特征预处理...")
 
         # 标准化特征
         X_scaled = self.scaler.fit_transform(self.features)
 
-        if use_pca:
-            # 保留95%的方差
-            self.pca = PCA(n_components=variance_ratio, random_state=42)
-            X_pca = self.pca.fit_transform(X_scaled)
+        # PCA降维
+        self.pca = PCA(n_components=0.95, random_state=42)
+        X_pca = self.pca.fit_transform(X_scaled)
 
-            print(f"原始特征维度: {X_scaled.shape[1]}")
-            print(f"PCA降维后维度: {X_pca.shape[1]}")
-            print(f"累计解释方差: {self.pca.explained_variance_ratio_.sum():.3f}")
+        print(f"原始特征维度: {X_scaled.shape[1]}")
+        print(f"PCA降维后维度: {X_pca.shape[1]}")
+        print(f"累计解释方差: {self.pca.explained_variance_ratio_.sum():.3f}")
 
-            return X_pca
-        else:
-            return X_scaled
+        return X_pca
 
-    def train_with_cross_validation(self):
+    def optimize_and_train_final_model(self):
         """
-        使用交叉验证训练模型
+        使用网格搜索优化参数并训练最终模型
         """
         print("\n" + "=" * 60)
-        print("使用交叉验证训练模型")
+        print("使用网格搜索优化SVM参数并训练最终模型")
         print("=" * 60)
 
-        # 预处理特征
-        X = self.preprocess_features(use_pca=True, variance_ratio=0.95)
+        # 预处理所有特征
+        X = self.preprocess_features()
         y = self.labels
 
-        # 划分训练集和验证集
-        X_train, X_val, y_train, y_val = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
-        )
-
         print(f"数据准备完成:")
-        print(f"  训练集大小: {X_train.shape[0]}")
-        print(f"  验证集大小: {X_val.shape[0]}")
-        print(f"  特征维度: {X_train.shape[1]}")
+        print(f"  总样本数: {X.shape[0]}")
+        print(f"  特征维度: {X.shape[1]}")
 
-        # 定义模型
-        models = {
-            'svm': self.train_svm(X_train, y_train),
-            'rf': self.train_random_forest(X_train, y_train),
-            'xgb': self.train_xgboost(X_train, y_train),
-            'knn': self.train_knn(X_train, y_train)
+        # 基于上次的最佳结果调整参数网格
+        param_grid = {
+            'C': [0.1, 1, 10, 100],  # 扩展C的范围
+            'gamma': ['scale', 'auto', 0.001, 0.01, 0.1],  # RBF核的gamma参数
+            'kernel': ['rbf']  # 只使用RBF核，上次效果最好
         }
 
-        # 评估单个模型
-        print("\n单个模型在验证集上的表现:")
-        for name, model in models.items():
-            y_pred = model.predict(X_val)
-            acc = accuracy_score(y_val, y_pred)
-            print(f"  {name.upper()}: 准确率 = {acc:.4f}")
+        # 创建SVM分类器
+        svm = SVC(random_state=42, class_weight='balanced')
 
-        # 创建堆叠集成模型
-        print("\n训练堆叠集成模型...")
-        estimators = [
-            ('svm', models['svm']),
-            ('rf', models['rf']),
-            ('xgb', models['xgb']),
-            ('knn', models['knn'])
-        ]
+        print("\n开始网格搜索优化参数...")
+        print(f"参数组合总数: {len(param_grid['C']) * len(param_grid['gamma']) * len(param_grid['kernel'])}")
+        print("这可能需要一些时间，请耐心等待...")
 
-        # 使用逻辑回归作为最终估计器
-        from sklearn.linear_model import LogisticRegression
-        stacking_clf = StackingClassifier(
-            estimators=estimators,
-            final_estimator=LogisticRegression(max_iter=1000, random_state=42),
-            cv=5
+        # 使用交叉验证进行网格搜索
+        grid_search = GridSearchCV(
+            svm,
+            param_grid,
+            cv=StratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+            scoring='accuracy',
+            n_jobs=1,  # 设置为1，避免并行处理导致内存问题
+            verbose=2,  # 显示详细进度
+            return_train_score=True
         )
 
-        stacking_clf.fit(X_train, y_train)
+        # 执行网格搜索
+        grid_search.fit(X, y)
 
-        # 评估堆叠模型
-        y_pred_stack = stacking_clf.predict(X_val)
-        acc_stack = accuracy_score(y_val, y_pred_stack)
-        print(f"堆叠模型准确率: {acc_stack:.4f}")
+        # 保存最佳参数
+        self.best_params_ = grid_search.best_params_
 
-        # 显示详细分类报告
-        print("\n堆叠模型分类报告:")
-        print(classification_report(y_val, y_pred_stack, target_names=self.classes))
+        print(f"\n网格搜索完成!")
+        print(f"最佳参数: {grid_search.best_params_}")
+        print(f"最佳交叉验证分数: {grid_search.best_score_:.4f}")
 
-        # 混淆矩阵
-        cm = confusion_matrix(y_val, y_pred_stack)
-        print("混淆矩阵:")
-        print(cm)
+        # 使用最佳模型作为最终模型
+        self.model = grid_search.best_estimator_
 
-        self.model = stacking_clf
+        # 显示交叉验证性能
+        self.show_cv_performance(grid_search)
 
-        # 在整个数据集上重新训练最终模型
-        print("\n使用所有数据重新训练最终模型...")
-        self.model.fit(X, y)
-
-        # 交叉验证评估
-        from sklearn.model_selection import cross_val_score
-        cv_scores = cross_val_score(self.model, X, y, cv=5, scoring='accuracy')
-        print(f"交叉验证准确率: {cv_scores.mean():.4f} (+/- {cv_scores.std():.4f})")
+        # 分析特征贡献
+        self.analyze_feature_contributions()
 
         return self.model
 
-    def train_svm(self, X_train, y_train):
-        """训练SVM模型"""
-        print("\n优化SVM参数...")
+    def show_cv_performance(self, grid_search):
+        """显示交叉验证性能"""
+        print(f"\n{'=' * 60}")
+        print("交叉验证性能分析")
+        print('=' * 60)
 
-        svm_param_grid = {
-            'C': [0.1, 1, 10],
-            'gamma': ['scale', 'auto', 0.01, 0.1],
-            'kernel': ['rbf']
+        cv_results = grid_search.cv_results_
+
+        # 显示前5个最佳参数组合
+        top_indices = np.argsort(cv_results['mean_test_score'])[-5:][::-1]
+
+        print("\n前5个最佳参数组合:")
+        for i, idx in enumerate(top_indices):
+            print(f"{i + 1}. 参数: {cv_results['params'][idx]}")
+            print(f"   平均验证分数: {cv_results['mean_test_score'][idx]:.4f}")
+            print(f"   标准差: {cv_results['std_test_score'][idx]:.4f}")
+
+        # 显示最佳模型的交叉验证分数分布
+        best_idx = grid_search.best_index_
+        best_scores = []
+        for i in range(grid_search.cv.n_splits):
+            score_key = f'split{i}_test_score'
+            if score_key in cv_results:
+                best_scores.append(cv_results[score_key][best_idx])
+
+        print(f"\n最佳模型的5折交叉验证分数:")
+        for i, score in enumerate(best_scores):
+            print(f"  第{i + 1}折: {score:.4f}")
+        print(f"  平均值: {np.mean(best_scores):.4f}")
+        print(f"  标准差: {np.std(best_scores):.4f}")
+
+    def analyze_feature_contributions(self):
+        """分析不同特征类型的贡献"""
+        print(f"\n{'=' * 60}")
+        print("特征类型贡献分析")
+        print('=' * 60)
+
+        # 特征维度信息（根据提取函数的实现）
+        feature_dimensions = {
+            'HOG特征': 1764,  # 128x128图像，pixels_per_cell=(16,16)时的HOG特征维度
+            '颜色直方图': 192,  # 32bin * 6通道 (RGB+HSV)
+            'LBP纹理': 59,  # uniform LBP特征
+            'Hu矩': 7,  # 7个Hu矩
+            '边缘统计': 4  # 4个边缘统计特征
         }
 
-        svm = SVC(random_state=42, class_weight='balanced', probability=True)
+        total_dim = sum(feature_dimensions.values())
 
-        svm_grid = GridSearchCV(
-            svm,
-            svm_param_grid,
-            cv=3,
-            scoring='accuracy',
-            n_jobs=1,
-            verbose=0
-        )
+        print("\n各特征类型维度分布:")
+        for feat_name, dim in feature_dimensions.items():
+            percentage = dim / total_dim * 100
+            print(f"  {feat_name}: {dim} 维 ({percentage:.1f}%)")
 
-        svm_grid.fit(X_train, y_train)
-        best_svm = svm_grid.best_estimator_
-        print(f"SVM最佳参数: {svm_grid.best_params_}")
-        print(f"SVM交叉验证分数: {svm_grid.best_score_:.4f}")
+        print(f"  总计: {total_dim} 维")
 
-        return best_svm
+        # 可视化特征维度分布
+        labels = list(feature_dimensions.keys())
+        sizes = list(feature_dimensions.values())
 
-    def train_random_forest(self, X_train, y_train):
-        """训练随机森林模型"""
-        print("\n优化随机森林参数...")
+        plt.figure(figsize=(10, 8))
+        plt.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140)
+        plt.title('特征类型维度分布', fontsize=16, fontweight='bold')
+        plt.axis('equal')
+        plt.tight_layout()
+        plt.show()
 
-        rf_param_grid = {
-            'n_estimators': [50, 100],
-            'max_depth': [10, 20, None],
-            'min_samples_split': [2, 5, 10],
-            'min_samples_leaf': [1, 2, 4]
-        }
-
-        rf = RandomForestClassifier(random_state=42, class_weight='balanced')
-
-        rf_grid = GridSearchCV(
-            rf,
-            rf_param_grid,
-            cv=3,
-            scoring='accuracy',
-            n_jobs=1,
-            verbose=0
-        )
-
-        rf_grid.fit(X_train, y_train)
-        best_rf = rf_grid.best_estimator_
-        print(f"随机森林最佳参数: {rf_grid.best_params_}")
-        print(f"随机森林交叉验证分数: {rf_grid.best_score_:.4f}")
-
-        return best_rf
-
-    def train_xgboost(self, X_train, y_train):
-        """训练XGBoost模型"""
-        print("\n优化XGBoost参数...")
-
-        xgb_param_grid = {
-            'n_estimators': [50, 100],
-            'max_depth': [3, 5, 7],
-            'learning_rate': [0.01, 0.1, 0.2],
-            'subsample': [0.8, 0.9, 1.0]
-        }
-
-        xgb_clf = xgb.XGBClassifier(
-            random_state=42,
-            objective='multi:softprob',
-            eval_metric='mlogloss',
-            use_label_encoder=False
-        )
-
-        xgb_grid = GridSearchCV(
-            xgb_clf,
-            xgb_param_grid,
-            cv=3,
-            scoring='accuracy',
-            n_jobs=1,
-            verbose=0
-        )
-
-        xgb_grid.fit(X_train, y_train)
-        best_xgb = xgb_grid.best_estimator_
-        print(f"XGBoost最佳参数: {xgb_grid.best_params_}")
-        print(f"XGBoost交叉验证分数: {xgb_grid.best_score_:.4f}")
-
-        return best_xgb
-
-    def train_knn(self, X_train, y_train):
-        """训练KNN模型"""
-        print("\n优化KNN参数...")
-
-        knn_param_grid = {
-            'n_neighbors': [3, 5, 7],
-            'weights': ['uniform', 'distance'],
-            'metric': ['euclidean', 'manhattan']
-        }
-
-        knn = KNeighborsClassifier()
-
-        knn_grid = GridSearchCV(
-            knn,
-            knn_param_grid,
-            cv=3,
-            scoring='accuracy',
-            n_jobs=1,
-            verbose=0
-        )
-
-        knn_grid.fit(X_train, y_train)
-        best_knn = knn_grid.best_estimator_
-        print(f"KNN最佳参数: {knn_grid.best_params_}")
-        print(f"KNN交叉验证分数: {knn_grid.best_score_:.4f}")
-
-        return best_knn
-
-    def save_model(self, filename='optimized_plant_classifier.pkl'):
+    def save_model(self, filename='final_multi_feature_classifier.pkl'):
         """保存模型"""
         if self.model is not None:
-            save_data = {
+            joblib.dump({
                 'model': self.model,
                 'scaler': self.scaler,
                 'pca': self.pca,
                 'classes': self.classes,
                 'img_size': self.img_size,
-                'label_encoder': self.label_encoder,
-                'best_params': self.best_params_
-            }
-
-            joblib.dump(save_data, filename)
+                'best_params': self.best_params_,
+                'feature_types': ['HOG', '颜色直方图', 'LBP', 'Hu矩', '边缘统计']
+            }, filename)
             print(f"\n模型已保存为 '{filename}'")
-            print(f"文件大小: {os.path.getsize(filename)} 字节")
         else:
             print("警告: 没有训练好的模型可以保存")
 
 
 def main():
     """
-    主函数：执行优化植物分类任务
+    主函数：执行多特征植物分类任务
     """
     # 设置数据集路径
-    data_path = "/kaggle/input/poject1/dataset-for-task1/dataset-for-task1/train"
+    data_path = '/kaggle/input/poject1/dataset-for-task1/dataset-for-task1/train'
 
     # 检查路径是否存在
     if not os.path.exists(data_path):
@@ -470,43 +377,42 @@ def main():
         return
 
     print("=" * 70)
-    print("机器学习课程设计 - 植物分类系统（特征工程优化版）")
-    print("=" * 70)
-    print("特征工程:")
-    print("  1. 颜色特征 (RGB直方图 + HSV统计)")
-    print("  2. HOG特征 (梯度方向直方图)")
-    print("  3. LBP特征 (局部二值模式)")
-    print("  4. 形状特征 (Hu矩)")
-    print("  5. 边缘特征 (Sobel算子)")
-    print("模型: SVM + 随机森林 + XGBoost + KNN 堆叠集成")
+    print("植物分类系统 - 多特征融合 + SVM模型")
+    print("特征包括: HOG, 颜色直方图, LBP, Hu矩, 边缘统计")
+    print("使用网格搜索优化参数")
     print("=" * 70)
 
     # 创建分类器
-    classifier = OptimizedPlantClassifier(data_path, img_size=(64, 64))
+    classifier = MultiFeaturePlantClassifier(data_path, img_size=(128, 128))
 
     try:
         # 1. 加载所有数据
         classifier.load_all_images()
 
-        # 2. 训练模型
-        model = classifier.train_with_cross_validation()
+        # 2. 使用网格搜索优化参数并训练最终模型
+        final_model = classifier.optimize_and_train_final_model()
 
         # 3. 保存模型
-        classifier.save_model('optimized_plant_classifier.pkl')
+        classifier.save_model()
 
         print("\n" + "=" * 70)
         print("植物分类任务完成！")
-        print(f"总图片数: {len(classifier.features)}")
-        print(f"特征维度: {classifier.features.shape[1]}")
-        print(f"PCA后维度: {classifier.pca.n_components_ if classifier.pca else '未使用'}")
-        print(f"模型类型: {type(model).__name__}")
-        print(f"模型已保存为 'optimized_plant_classifier.pkl'")
+        print(f"特征工程方法: 多特征融合")
+        print(f"  1. HOG特征 (形状和边缘)")
+        print(f"  2. 颜色直方图 (颜色分布)")
+        print(f"  3. LBP特征 (局部纹理)")
+        print(f"  4. Hu矩 (形状不变特征)")
+        print(f"  5. 边缘统计 (边缘特征)")
+        print(f"分类模型: SVM（支持向量机）")
+        print(f"参数优化: 网格搜索")
+        print(f"每个类别的100张图片已全部用于学习")
+        print(f"模型已保存为 'final_multi_feature_classifier.pkl'")
         print("=" * 70)
 
     except MemoryError:
         print("\n内存不足！尝试以下解决方案:")
-        print("1. 进一步减小图像尺寸: 将 img_size=(64, 64) 改为 (32, 32)")
-        print("2. 减少特征维度: 修改PCA参数，如使用 variance_ratio=0.90")
+        print("1. 减小图像尺寸: 将 img_size=(128, 128) 改为 (64, 64)")
+        print("2. 减少特征维度: 修改特征提取参数")
         print("3. 关闭其他程序释放内存")
     except Exception as e:
         print(f"\n运行过程中出错: {e}")

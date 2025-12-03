@@ -4,17 +4,15 @@ import cv2
 from skimage.feature import hog, local_binary_pattern
 import joblib
 import pandas as pd
-import datetime
 import warnings
-from tqdm import tqdm
 
 warnings.filterwarnings('ignore')
 
 
-class OptimizedPlantPredictor:
-    def __init__(self, model_path, test_data_path, img_size=(64, 64)):
+class MultiFeaturePredictor:
+    def __init__(self, model_path, test_data_path, img_size=(128, 128)):
         """
-        初始化优化植物预测器
+        初始化多特征预测器
         Args:
             model_path: 训练好的模型文件路径
             test_data_path: 测试集图像文件夹路径
@@ -46,26 +44,25 @@ class OptimizedPlantPredictor:
         self.scaler = saved_data['scaler']
         self.pca = saved_data['pca']
         self.classes = saved_data['classes']
-        self.training_img_size = saved_data.get('img_size', (64, 64))
-        self.label_encoder = saved_data.get('label_encoder', None)
+        self.training_img_size = saved_data.get('img_size', (128, 128))
 
         # 确保图像尺寸一致
         if self.training_img_size != self.img_size:
             print(f"警告: 训练时图像尺寸为 {self.training_img_size}，预测时设置为 {self.img_size}")
-            # 使用训练时的尺寸
+            # 如果不同，使用训练时的尺寸
             self.img_size = self.training_img_size
 
         print(f"模型加载成功!")
         print(f"类别数量: {len(self.classes)}")
         print(f"类别名称: {self.classes}")
         print(f"图像尺寸: {self.img_size}")
-        print(f"模型类型: {type(self.model).__name__}")
+        print(f"特征类型: {saved_data.get('feature_types', ['未知'])}")
 
-    def extract_optimized_features(self, img_path):
+    def extract_multi_features(self, img_path):
         """
-        提取优化的特征集（与训练时完全一致）
+        提取多种特征（必须与训练时完全一致）
         Args:
-            img_path: 图像路径
+            img_path: 图像文件路径
         Returns:
             融合特征向量
         """
@@ -73,7 +70,7 @@ class OptimizedPlantPredictor:
             # 读取图像
             img = cv2.imread(img_path)
             if img is None:
-                print(f"无法读取图像: {img_path}")
+                print(f"警告: 无法读取图像 {img_path}")
                 return None
 
             # 调整图像大小
@@ -82,107 +79,66 @@ class OptimizedPlantPredictor:
 
             feature_vector = []
 
-            # 1. 颜色特征
-            color_features = self.extract_color_features(img_resized)
-            feature_vector.extend(color_features)
-
-            # 2. HOG特征
-            hog_features = self.extract_hog_features(gray)
+            # 1. HOG特征
+            hog_features = hog(
+                gray,
+                orientations=9,
+                pixels_per_cell=(16, 16),
+                cells_per_block=(2, 2),
+                block_norm='L2-Hys',
+                feature_vector=True
+            )
             feature_vector.extend(hog_features)
 
+            # 2. 颜色直方图特征
+            # RGB颜色直方图
+            for i in range(3):
+                hist = cv2.calcHist([img_resized], [i], None, [32], [0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
+                feature_vector.extend(hist)
+
+            # HSV颜色空间
+            hsv = cv2.cvtColor(img_resized, cv2.COLOR_BGR2HSV)
+            for i in range(3):
+                if i == 0:  # Hue通道
+                    hist = cv2.calcHist([hsv], [i], None, [32], [0, 180])
+                else:
+                    hist = cv2.calcHist([hsv], [i], None, [32], [0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
+                feature_vector.extend(hist)
+
             # 3. LBP特征
-            lbp_features = self.extract_lbp_features(gray)
-            feature_vector.extend(lbp_features)
+            radius = 2
+            n_points = 8 * radius
+            lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
+            hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, n_points + 3), range=(0, n_points + 2))
+            hist = hist.astype("float")
+            hist /= (hist.sum() + 1e-6)
+            feature_vector.extend(hist)
 
-            # 4. 形状特征
-            shape_features = self.extract_shape_features(gray)
-            feature_vector.extend(shape_features)
+            # 4. Hu矩
+            moments = cv2.moments(gray)
+            hu_moments = cv2.HuMoments(moments).flatten()
+            hu_moments = -np.sign(hu_moments) * np.log10(np.abs(hu_moments) + 1e-10)
+            feature_vector.extend(hu_moments)
 
-            # 5. 边缘特征
-            edge_features = self.extract_edge_features(gray)
+            # 5. 边缘特征统计
+            sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            sobel_magnitude = np.sqrt(sobelx ** 2 + sobely ** 2)
+            edge_features = [
+                np.mean(sobel_magnitude),
+                np.std(sobel_magnitude),
+                np.max(sobel_magnitude),
+                np.sum(sobel_magnitude > np.mean(sobel_magnitude)) / sobel_magnitude.size
+            ]
             feature_vector.extend(edge_features)
 
             return np.array(feature_vector)
 
         except Exception as e:
-            print(f"处理图像 {img_path} 时出错: {e}")
+            print(f"提取特征时出错 ({img_path}): {e}")
             return None
-
-    def extract_color_features(self, color_img):
-        """提取颜色特征"""
-        features = []
-
-        # RGB颜色直方图
-        for i in range(3):
-            hist = cv2.calcHist([color_img], [i], None, [32], [0, 256])
-            hist = cv2.normalize(hist, hist).flatten()
-            features.extend(hist)
-
-        # HSV颜色空间的统计特征
-        hsv = cv2.cvtColor(color_img, cv2.COLOR_BGR2HSV)
-        hsv_features = []
-        for i in range(3):
-            channel = hsv[:, :, i]
-            hsv_features.extend([np.mean(channel), np.std(channel), np.median(channel)])
-        features.extend(hsv_features)
-
-        return features
-
-    def extract_hog_features(self, gray_img):
-        """提取HOG特征"""
-        hog_features = hog(
-            gray_img,
-            orientations=8,
-            pixels_per_cell=(16, 16),
-            cells_per_block=(2, 2),
-            block_norm='L2-Hys',
-            feature_vector=True
-        )
-        return hog_features
-
-    def extract_lbp_features(self, gray_img):
-        """提取LBP特征"""
-        radius = 2
-        n_points = 8 * radius
-        lbp = local_binary_pattern(gray_img, n_points, radius, method='uniform')
-        hist, _ = np.histogram(lbp.ravel(), bins=np.arange(0, n_points + 3), range=(0, n_points + 2))
-        hist = hist.astype("float")
-        hist /= (hist.sum() + 1e-6)
-        return hist
-
-    def extract_shape_features(self, gray_img):
-        """提取形状特征"""
-        features = []
-
-        # Hu矩
-        moments = cv2.moments(gray_img)
-        hu_moments = cv2.HuMoments(moments).flatten()
-
-        for moment in hu_moments:
-            if moment != 0:
-                features.append(-np.sign(moment) * np.log10(abs(moment)))
-            else:
-                features.append(0)
-
-        return features
-
-    def extract_edge_features(self, gray_img):
-        """提取边缘特征"""
-        features = []
-
-        # Sobel边缘
-        sobelx = cv2.Sobel(gray_img, cv2.CV_64F, 1, 0, ksize=3)
-        sobely = cv2.Sobel(gray_img, cv2.CV_64F, 0, 1, ksize=3)
-        sobel_magnitude = np.sqrt(sobelx ** 2 + sobely ** 2)
-
-        edge_features = [
-            np.mean(sobel_magnitude),
-            np.std(sobel_magnitude),
-            np.max(sobel_magnitude)
-        ]
-
-        features.extend(edge_features)
-        return features
 
     def preprocess_features(self, features):
         """
@@ -212,37 +168,30 @@ class OptimizedPlantPredictor:
             (预测类别, 预测概率)
         """
         # 提取特征
-        features = self.extract_optimized_features(img_path)
+        features = self.extract_multi_features(img_path)
         if features is None:
             return None, None
-
-        # 检查特征维度
-        expected_dim = self.scaler.n_features_in_
-        if len(features) != expected_dim:
-            print(f"警告: 特征维度不匹配，期望 {expected_dim}，实际 {len(features)}")
-            # 简单处理：截断或填充
-            if len(features) < expected_dim:
-                features = np.pad(features, (0, expected_dim - len(features)), 'constant')
-            else:
-                features = features[:expected_dim]
 
         # 预处理特征
         processed_features = self.preprocess_features(features)
 
         # 预测
         try:
-            # 预测类别索引
-            prediction_idx = self.model.predict(processed_features)[0]
+            # 预测类别
+            prediction = self.model.predict(processed_features)[0]
 
-            # 获取预测概率
+            # 获取预测概率（如果模型支持）
             if hasattr(self.model, 'predict_proba'):
                 probabilities = self.model.predict_proba(processed_features)[0]
-                confidence = probabilities[prediction_idx]
+                confidence = probabilities[prediction]
             else:
-                confidence = 1.0
+                # 对于SVC，需要使用decision_function
+                decision_values = self.model.decision_function(processed_features)[0]
+                confidence = np.max(decision_values) / 10.0  # 简化处理
+                confidence = min(max(confidence, 0.0), 1.0)
 
             # 获取类别名称
-            predicted_class = self.classes[prediction_idx]
+            predicted_class = self.classes[prediction]
 
             return predicted_class, confidence
 
@@ -276,30 +225,32 @@ class OptimizedPlantPredictor:
         # 存储结果
         results = []
 
-        # 逐个处理图像（使用tqdm显示进度）
-        for img_path in tqdm(test_images, desc="处理测试图像"):
+        # 逐个处理图像
+        for i, img_path in enumerate(test_images):
             # 获取文件名（不包含路径）
             filename = os.path.basename(img_path)
+
+            if (i + 1) % 10 == 0:
+                print(f"处理图像 {i + 1}/{len(test_images)}: {filename}")
 
             # 预测
             predicted_class, confidence = self.predict_image(img_path)
 
             if predicted_class is None:
-                print(f"  警告: 无法预测 {filename}，使用默认类别")
-                predicted_class = self.classes[0]
-                confidence = 0.0
+                print(f"  警告: 无法预测 {filename}，跳过此图像")
+                continue
 
             # 添加到结果列表
             results.append({
                 'ID': filename,
                 'Category': predicted_class,
-                'Confidence': confidence
+                'Confidence': confidence  # 可选：保留置信度信息
             })
 
         # 创建DataFrame
         df = pd.DataFrame(results)
 
-        # 保存为CSV文件
+        # 保存为CSV文件（只保留ID和Category两列）
         submission_df = df[['ID', 'Category']]
         submission_df.to_csv(output_csv, index=False)
 
@@ -334,48 +285,32 @@ class OptimizedPlantPredictor:
             avg_confidence = df['Confidence'].mean()
             print(f"\n平均预测置信度: {avg_confidence:.3f}")
 
-            # 显示置信度分布
-            confidence_bins = [0.0, 0.3, 0.5, 0.7, 0.9, 1.0]
-            for i in range(len(confidence_bins) - 1):
-                low = confidence_bins[i]
-                high = confidence_bins[i + 1]
-                count = ((df['Confidence'] >= low) & (df['Confidence'] < high)).sum()
-                if i == len(confidence_bins) - 2:
-                    count = (df['Confidence'] >= low).sum()
-                percentage = count / len(df) * 100
-                print(f"  置信度 [{low:.1f}-{high:.1f}): {count} 张 ({percentage:.1f}%)")
-
 
 def main():
     """
     主函数：执行测试集预测
     """
     # 设置路径
-    model_path = "optimized_plant_classifier.pkl"  # 优化后的模型文件
-    test_data_path = "/kaggle/input/poject1/dataset-for-task1/dataset-for-task1/test"
+    model_path = "final_multi_feature_classifier.pkl"  # 训练好的多特征模型文件
+    test_data_path = '/kaggle/input/poject1/dataset-for-task1/dataset-for-task1/test'
+    output_csv = "submission-for-task1.csv"  # 输出的CSV文件名
 
     print("=" * 70)
-    print("机器学习课程设计 - 植物分类测试系统")
+    print("植物分类测试集预测系统 - 多特征融合")
     print("=" * 70)
 
     # 检查模型文件是否存在
     if not os.path.exists(model_path):
         print(f"错误: 模型文件不存在: {model_path}")
-        print("请先运行训练代码生成模型")
+        print("请确保已经训练并保存了模型")
         return
-
-    # 生成带时间戳的输出文件名
-    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_csv = f"submission_{timestamp}.csv"
-
-    print(f"输出文件将保存为: {output_csv}")
 
     # 创建预测器
     try:
-        predictor = OptimizedPlantPredictor(
+        predictor = MultiFeaturePredictor(
             model_path=model_path,
             test_data_path=test_data_path,
-            img_size=(64, 64)  # 与训练时保持一致
+            img_size=(128, 128)
         )
 
         # 预测整个测试集
